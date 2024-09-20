@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Module
+    _ = b.addModule("gps", .{
+        .root_source_file = b.path("src/gps.zig"),
+    });
+
+    // Static Lib
     const zgps_lib = b.addStaticLibrary(.{
         .name = "zig-gps",
         .root_source_file = b.path("src/gps.zig"),
@@ -22,6 +28,7 @@ pub fn build(b: *std.Build) void {
     const build_docs_step = b.step("docs", "Build the zig-gps library docs");
     build_docs_step.dependOn(&build_docs.step);
 
+    // Tests
     const lib_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
