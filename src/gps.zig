@@ -1,6 +1,7 @@
 const std = @import("std");
 const json = std.json;
 const mem = std.mem;
+const meta = std.meta;
 const net = std.net;
 const testing = std.testing;
 
@@ -18,7 +19,7 @@ pub const Location = struct{
 /// Client Config
 pub const ClientConfig = struct {
     /// IP Address and Port for the GPSD TCP Connection.
-    gpsd_addr: net.Address = net.Address.parseIp("127.0.0.1", 2947),
+    gpsd_addr: net.Address = net.Address.parseIp("127.0.0.1", 2947) catch unreachable,
     /// Ignore unknown JSON fields.
     ignore_unknown_fields: bool = true,
     /// Ignore corrupted JSON Messages.
@@ -42,7 +43,11 @@ pub const Client = struct {
         var conn = try alloc.create(net.Stream);
         errdefer alloc.destroy(conn);
         conn.* = try net.tcpConnectToAddress(config.gpsd_addr);
+        const ver_json = try conn.reader().readUntilDelimiterAlloc(alloc, '\n', config.max_size);
+        defer alloc.free(ver_json);
         try conn.writeAll("?WATCH={\"enable\":true, \"json\":true}");
+        const watch_json = try conn.reader().readUntilDelimiterAlloc(alloc, '\n', config.max_size);
+        defer alloc.free(watch_json);
         errdefer conn.close();
         return .{
             .alloc = alloc,
@@ -107,7 +112,7 @@ pub const Client = struct {
             tpv.lon == null
         ) return null;
         self.cur_loc = .{
-            .time = self.alloc.dupe(tpv.time.?) catch return null,
+            .time = self.alloc.dupe(u8, tpv.time.?) catch return null,
             .lat = tpv.lat.?,
             .lon = tpv.lon.?,
             .alt = tpv.altMSL,
@@ -145,22 +150,7 @@ pub const Client = struct {
         try self.conn.writeAll("?POLL;");
         const response_json = try self.conn.reader().readUntilDelimiterAlloc(self.alloc, '\n', self.config.max_size);
         defer self.alloc.free(response_json);
-        return json.parseFromSlice(
-            response.Poll,
-            self.alloc,
-            response_json,
-            self.json_config,
-        ) catch {
-            const err_response = try json.parseFromSlice(
-                response.Error,
-                self.alloc,
-                response_json,
-                self.json_config,
-            );
-            defer err_response.deinit();
-            self.gpsd_error = try self.alloc.dupe(u8, err_response.value.message);
-            return error.GPSDCommandError;
-        };
+        return self.parseJSON(response.Poll);
     }
 
     /// Get the GPSD Version using GPSD's `?VERSION;` command.
@@ -169,22 +159,7 @@ pub const Client = struct {
         try self.conn.writeAll("?VERSION;");
         const response_json = try self.conn.reader().readUntilDelimiterAlloc(self.alloc, '\n', self.config.max_size);
         defer self.alloc.free(response_json);
-        return json.parseFromSlice(
-            response.Version,
-            self.alloc,
-            response_json,
-            self.json_config,
-        ) catch {
-            const err_response = try json.parseFromSlice(
-                response.Error,
-                self.alloc,
-                response_json,
-                self.json_config,
-            );
-            defer err_response.deinit();
-            self.gpsd_error = try self.alloc.dupe(u8, err_response.value.message);
-            return error.GPSDCommandError;
-        };
+        return self.parseJSON(response.Version);
     }
 
     /// Get the GPSD Devices using GPSD's `?DEVICES;` command.
@@ -193,8 +168,55 @@ pub const Client = struct {
         try self.conn.writeAll("?DEVICES;");
         const response_json = try self.conn.reader().readUntilDelimiterAlloc(self.alloc, '\n', self.config.max_size);
         defer self.alloc.free(response_json);
+        return self.parseJSON(response.Devices);
+    }
+
+    /// Device Config for setting Device parameters.
+    pub const DeviceConfig = struct {
+        path: ?[]const u8 = null,
+        bps: ?u32 = null,
+        cycle: ?f64 = null,
+        hexdata: ?[]const u8 = null,
+        parity: ?[]const u8 = null,
+    };
+
+    /// Get or Set a GPSD Device using GPSD's `?DEVICE` command.
+    /// This is technically blocking, but GPSD typically replies immediately.
+    pub fn device(self: *@This(), set: bool, config: DeviceConfig) !json.Parsed(response.Device) {
+        var cmd_buf = std.ArrayList(u8).init(self.alloc);
+        defer cmd_buf.deinit();
+        try cmd_buf.appendSlice("?DEVICE");
+        if (!set) try cmd_buf.append(';')
+        else {
+            try cmd_buf.appendSlice("={");
+            var add_sep = false;
+            inline for (meta.fields(DeviceConfig)) |field| cont: {
+                if (field.type == bool) break :cont;
+                if (@field(config, field.name)) |param| {
+                    if (add_sep) try cmd_buf.append(',');
+                    add_sep = true;
+                    switch (@TypeOf(param)) {
+                        []const u8 => try cmd_buf.writer().print("\"{s}\":\"{s}\"", .{ field.name, param }),
+                        else => try cmd_buf.writer().print("\"{s}\":{any}", .{ field.name, param }),
+                    }
+                }
+            }
+            try cmd_buf.append('}');
+            //std.log.debug("Device Set JSON:\n{s}", .{ cmd_buf.items });
+        }
+        try self.conn.writeAll(cmd_buf.items);
+        const watch_response = try self.parseJSON(response.Watch);
+        defer watch_response.deinit();
+        return self.parseJSON(response.Device);
+    }
+
+    /// Parse a JSON Message or Response
+    fn parseJSON(self: *@This(), T: type) !json.Parsed(T) {
+        const response_json = try self.conn.reader().readUntilDelimiterAlloc(self.alloc, '\n', self.config.max_size);
+        defer self.alloc.free(response_json);
+        //std.log.debug("{s}", .{ response_json });
         return json.parseFromSlice(
-            response.Devices,
+            T,
             self.alloc,
             response_json,
             self.json_config,
